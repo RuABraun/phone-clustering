@@ -5,7 +5,7 @@ import os
 import python_rw
 
 
-def calc_feats(datadir, aug_datadir):
+def calc_feats(datadir, aug_datadir, pitch_datadir):
     if not os.path.exists(f'{datadir}/feats.scp'):
         cmd = f'cd /work; steps/make_fbank.sh --nj 8 --cmd util/queue.pl --fbank-config conf/fbank.conf {datadir}'
         sp.check_output(cmd, shell=True)
@@ -13,7 +13,15 @@ def calc_feats(datadir, aug_datadir):
     if not os.path.exists(f'{aug_datadir}/feats.scp'):
         cmd = f'cd /work; LC_ALL=en_GB.UTF-8 python3 steps/data/augment_additive.py --include-prob 1.0 --utt-suffix "" --fg-snrs "13:11:9:7" --fg-noise-dir /data/noise/musan/noise --mg-snrs "9:11:13" --mg-noise-dir /data/noise/musan/music --bg-snrs "21:19:17:15" --num-bg-noises "3:4:5:6" --bg-noise-dir /data/noise/musan/speech {datadir} {aug_datadir}'
         sp.check_output(cmd, shell=True)
-        cmd = f'cd /work; steps/make_fbank.sh --nj 8 --cmd utils/queue.pl --fbank-config conf/fbank.conf {aug_datadir}'
+        cmd = f'cd /work; steps/make_fbank.sh --nj 12 --cmd utils/queue.pl --fbank-config conf/fbank.conf {aug_datadir}'
+        sp.check_output(cmd, shell=True)
+
+    if not os.path.exists(f'{pitch_datadir}/feats.scp'):
+        cmd = f'cd /work; utils/copy_data_dir.sh {datadir} {pitch_datadir}'
+        sp.check_output(cmd, shell=True)
+        cmd = f'py3 alter_pitch.py {pitch_datadir}/wav.scp'
+        sp.check_output(cmd, shell=True)
+        cmd = f'cd /work; steps/make_fbank.sh --nj 8 --cmd utils/queue.pl --fbank-config conf/fbank.conf {pitch_datadir}'
         sp.check_output(cmd, shell=True)
 
 
@@ -50,6 +58,7 @@ def select_feats(arkf, phonealif, keys, outf):
                     if len(data_arr) > 4:
                         data.append(np.array(data_arr))
                     data_arr = []
+
             if len(data_arr) > 4:
                 data.append(np.array(data_arr))
             ismore = feats_reader.next()
@@ -66,7 +75,8 @@ def main(datadir, alif, workdir, outf_base):
     model = os.path.dirname(alif) + '/final.mdl'
 
     aug_datadir = '{}_augmented'.format(datadir.rstrip('/'))
-    calc_feats(datadir, aug_datadir)
+    pitch_datadir = '{}_pitched'.format(datadir.rstrip('/'))
+    calc_feats(datadir, aug_datadir, pitch_datadir)
 
     # convert ali to phones
     cmd = f'ali-to-phones --per-frame=true {model} "ark:gunzip -c {alif}|" ark,scp:{workdir}/phoneali,{workdir}/phoneali.scp'
@@ -94,6 +104,13 @@ def main(datadir, alif, workdir, outf_base):
     sp.check_output(cmd, shell=True)
     select_feats(f'ark:{aug_datadir}/data/raw_fbank_all.ark', f'{workdir}/phoneali_sorted.txt', keys,
                  outf_base + '_aug')
+
+    cmd = f'sort -u {pitch_datadir}/feats.scp -o {pitch_datadir}/feats_sorted.scp'
+    sp.check_output(cmd, shell=True)
+    cmd = f'copy-feats scp:{pitch_datadir}/feats_sorted.scp ark:{pitch_datadir}/data/raw_fbank_all.ark'
+    sp.check_output(cmd, shell=True)
+    select_feats(f'ark:{pitch_datadir}/data/raw_fbank_all.ark', f'{workdir}/phoneali_sorted.txt', keys,
+                 outf_base + '_pitch')
 
 
 plac.call(main)

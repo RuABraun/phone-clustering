@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import torch.utils.data
 from loguru import logger
 
-BATCH_SIZE = 512
+BATCH_SIZE = 2048
 DEVICE = ""
 
 
@@ -23,16 +23,13 @@ class DataHolder(to.utils.data.Dataset):
         logger.info(f"Num samples: {self.size}")
 
     def __len__(self):
-        return self.size
+        return self.size - 2
 
     def __getitem__(self, idx):
-        spec = self.data[idx]
-        idx = random.randint(1, spec.shape[0]-3)  # so that 0 and end never queried
-        f = np.copy(spec[idx - 1 : idx + 2])
-        f_aug = np.copy(spec[idx - 1 : idx + 2])
-        f_shift = np.copy(spec[idx: idx + 3])
-        mat = np.array([f, f_aug, f_shift], dtype=np.float32)
-        return mat
+        idx += 1
+        f = self.data[idx - 1 : idx + 2]
+        f_aug = self.data[idx - 1 : idx + 2]
+        return np.asarray([f, f_aug])
 
 
 def compute_joint(x_out, x_tf_out):
@@ -64,35 +61,55 @@ def IID_loss(x_out, x_tf_out, EPS=sys.float_info.epsilon):
     return loss
 
 
+class ResBlock(nn.Module):
+    def __init__(self, small_dim, large_dim):
+        super(ResBlock, self).__init__()
+        self.fc1 = nn.Linear(small_dim, large_dim, bias=False)
+        self.bn1 = nn.BatchNorm1d(large_dim)
+        self.fc2 = nn.Linear(large_dim, small_dim)
+        self.bn2 = nn.BatchNorm1d(small_dim)
+
+    def forward(self, x):
+        return F.relu(self.bn2(self.fc2(F.relu(self.bn1(self.fc1(x)))))) + x
+
+
 class Net(nn.Module):
-    def __init__(self, num_heads=5):
+    def __init__(self, num_heads=5, num_res_blocks=3):
         super(Net, self).__init__()
         self.conv1 = nn.Conv2d(1, 256, (1, 40), 1, bias=False)
         self.bn1 = nn.BatchNorm2d(256)
-        self.fc_1 = nn.Linear(256 * 3, 1024, bias=False)
-        self.bn_fc1 = nn.BatchNorm1d(1024)
-        self.fc_2 = nn.Linear(1024, 256, bias=False)
-        self.fc_3 = nn.Linear(256, 1024, bias=False)
-        self.bn_fc3 = nn.BatchNorm1d(1024)
 
-        self.fc_fin = nn.ModuleList([nn.Linear(1024, 300) for _ in range(5)])
-        self.fc_fin_alt = nn.ModuleList([nn.Linear(1024, 600) for _ in range(5)])
+        self.fc_in = nn.Linear(3 * 40, 256, bias=False)
+        self.bn_fcin = nn.BatchNorm1d(256)
 
-    def forward(self, x):
-        logger.debug(x.size())
-        bs = x.size(0)
+        self.fc_1 = nn.Linear(256 * 3, 256, bias=False)
+        self.bn_fc1 = nn.BatchNorm1d(256)
+
+        self.blocks = nn.ModuleList([ResBlock(256, 1024) for _ in range(num_res_blocks)])
+        # self.fc_prefinal = nn.Linear(256, 1024)
+
+        self.fc_fin = nn.ModuleList([nn.Linear(256, 192) for _ in range(num_heads)])
+        self.fc_fin_alt = nn.ModuleList([nn.Linear(256, 400) for _ in range(num_heads)])
+
+    def forward(self, xin):
+        logger.debug(xin.shape)
+        bs = xin.shape[0]
 
         # xview = x.view(bs, 1, x.size(1), x.size(2))
-        x = x.unsqueeze(1)
-        x = F.relu(self.bn1(self.conv1(x)))
-        logger.debug(x.size())
+        x = F.relu(self.bn1(self.conv1(xin)))
+        logger.debug(x.shape)
 
         x = x.view(bs, -1)
-        x_fc1 = F.relu(self.bn_fc1(self.fc_1(x)))
-        logger.debug(x.size())
-        x_prefinal = F.relu(self.bn_fc3(self.fc_3(self.fc_2(x_fc1))) + x_fc1)
+        xin = xin.view(bs, -1)
 
-        logger.debug(x.size())
+        x_prefinal = F.relu(self.bn_fc1(self.fc_1(x))) + F.relu(self.bn_fcin(self.fc_in(xin)))
+
+        logger.debug(x.shape)
+        for block in self.blocks:
+            x_prefinal = block(x_prefinal)
+        # x_prefinal = self.fc_prefinal(x_prefinal)
+
+        logger.debug(x.shape)
         x = [F.softmax(fc(x_prefinal), dim=1) for fc in self.fc_fin]
         x_alt = [F.softmax(fc(x_prefinal), dim=1) for fc in self.fc_fin_alt]
         return x, x_alt
@@ -102,7 +119,7 @@ def train(num_epochs, lr):
 
     model = Net()
     optimizer = to.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.9))
-    dataholder = DataHolder("data_small.npy", "data_aug_small.npy")
+    dataholder = DataHolder("data_small_flat.npy", "data_aug_small_flat.npy")
     dataloader = to.utils.data.DataLoader(
         dataholder, batch_size=BATCH_SIZE, shuffle=True, num_workers=2
     )
@@ -112,8 +129,10 @@ def train(num_epochs, lr):
     for epoch in range(1, num_epochs + 1):
         model.train()
         for j, batch in enumerate(dataloader):
-            input_normal = batch[:, 0].repeat(2, 1, 1).to(DEVICE)
-            input_aug = batch[:, 1:].reshape(batch.size(0) * 2, -1, batch.size(-1)).to(DEVICE)
+            input_normal = batch[:, 0].to(DEVICE)
+            input_aug = batch[:, 1].to(DEVICE)
+            input_normal = input_normal.unsqueeze(1)
+            input_aug = input_aug.unsqueeze(1)
 
             output, output_alt = model(input_normal)
             output_aug, output_aug_alt = model(input_aug)
@@ -130,6 +149,8 @@ def train(num_epochs, lr):
                         epoch, lr, loss.item()
                     )
                 )
+
+    to.save(model.state_dict(), 'model.pt')
 
 
 def main(debug: ("Print debug messages", "flag", "d")):
@@ -157,7 +178,8 @@ def main(debug: ("Print debug messages", "flag", "d")):
         DEVICE = "cuda:1"
     logger.info(f"Using device {DEVICE}")
 
-    train(5, 0.01)
+    train(3, 0.005)
 
 
-plac.call(main)
+if __name__ == '__main__':
+    plac.call(main)
