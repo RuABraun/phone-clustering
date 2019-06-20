@@ -8,18 +8,21 @@ import torch as to
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
+from hyperopt import fmin, tpe, hp
 from loguru import logger
 
 BATCH_SIZE = 2048
+NUM_HEADS = 5
 DEVICE = ""
 
 
 class DataHolder(to.utils.data.Dataset):
-    def __init__(self, data_f, data_aug_f):
-        self.data = np.load(data_f)
-        self.data_aug = np.load(data_aug_f)
+    def __init__(self, data_f, data_aug_f, data_pitch_f):
+        self.data = np.load(data_f)[:-1]
+        self.data_aug = np.load(data_aug_f)[:-1]
+        self.data_pitch = np.load(data_pitch_f)
         self.size = self.data.shape[0]
-        assert self.size == self.data_aug.shape[0]
+        assert self.size == self.data_aug.shape[0] == self.data_pitch.shape[0], '{} {} {}'.format(self.size, self.data_aug.shape[0], self.data_pitch.shape[0])
         logger.info(f"Num samples: {self.size}")
 
     def __len__(self):
@@ -27,9 +30,10 @@ class DataHolder(to.utils.data.Dataset):
 
     def __getitem__(self, idx):
         idx += 1
-        f = self.data[idx - 1 : idx + 2]
-        f_aug = self.data[idx - 1 : idx + 2]
-        return np.asarray([f, f_aug])
+        f = self.data[idx - 1: idx + 2]
+        f_aug = self.data_aug[idx - 1: idx + 2]
+        f_pitch = self.data_pitch[idx - 1: idx + 2]
+        return np.asarray([f, f_aug, f_pitch])
 
 
 def compute_joint(x_out, x_tf_out):
@@ -66,16 +70,17 @@ class ResBlock(nn.Module):
         super(ResBlock, self).__init__()
         self.fc1 = nn.Linear(small_dim, large_dim, bias=False)
         self.bn1 = nn.BatchNorm1d(large_dim)
-        self.fc2 = nn.Linear(large_dim, small_dim)
+        self.fc2 = nn.Linear(large_dim, small_dim, bias=False)
         self.bn2 = nn.BatchNorm1d(small_dim)
 
     def forward(self, x):
-        return F.relu(self.bn2(self.fc2(F.relu(self.bn1(self.fc1(x)))))) + x
+        return F.relu(self.bn2(self.fc2(F.relu(self.bn1(self.fc1(x)))))) + 0.66 * x
 
 
 class Net(nn.Module):
-    def __init__(self, num_heads=5, num_res_blocks=3):
+    def __init__(self, num_heads=NUM_HEADS, num_res_blocks=3):
         super(Net, self).__init__()
+        self.bnin = nn.BatchNorm2d(1)
         self.conv1 = nn.Conv2d(1, 256, (1, 40), 1, bias=False)
         self.bn1 = nn.BatchNorm2d(256)
 
@@ -86,16 +91,17 @@ class Net(nn.Module):
         self.bn_fc1 = nn.BatchNorm1d(256)
 
         self.blocks = nn.ModuleList([ResBlock(256, 1024) for _ in range(num_res_blocks)])
-        # self.fc_prefinal = nn.Linear(256, 1024)
+        self.fc_prefinal = nn.Linear(256, 512, bias=False)
+        self.bn_prefinal = nn.BatchNorm1d(512)
 
-        self.fc_fin = nn.ModuleList([nn.Linear(256, 192) for _ in range(num_heads)])
-        self.fc_fin_alt = nn.ModuleList([nn.Linear(256, 400) for _ in range(num_heads)])
+        self.fc_fin = nn.ModuleList([nn.Linear(512, 192) for _ in range(num_heads)])
+        self.fc_fin_alt = nn.ModuleList([nn.Linear(512, 400) for _ in range(num_heads)])
 
     def forward(self, xin):
         logger.debug(xin.shape)
         bs = xin.shape[0]
+        xin = self.bnin(xin)
 
-        # xview = x.view(bs, 1, x.size(1), x.size(2))
         x = F.relu(self.bn1(self.conv1(xin)))
         logger.debug(x.shape)
 
@@ -107,30 +113,60 @@ class Net(nn.Module):
         logger.debug(x.shape)
         for block in self.blocks:
             x_prefinal = block(x_prefinal)
-        # x_prefinal = self.fc_prefinal(x_prefinal)
+        x_prefinal = F.relu(self.bn_prefinal(self.fc_prefinal(x_prefinal)))
 
         logger.debug(x.shape)
         x = [F.softmax(fc(x_prefinal), dim=1) for fc in self.fc_fin]
         x_alt = [F.softmax(fc(x_prefinal), dim=1) for fc in self.fc_fin_alt]
         return x, x_alt
 
+def report_gradnorms(model):
+    minnorm = 10
+    maxnorm = 0
+    Wnamemin = None
+    Wnamemax = None
+    maxbnnorm = 0
+    BNnamemax = None
+    for name, p in model.named_parameters():
+        if 'bias' in name:
+            continue
+        gradnorm = torch.norm(p.grad).item()
+        if 'bn' in name:
+            if gradnorm > maxbnnorm:
+                maxbnnorm = gradnorm
+                BNnamemax = name
+            continue
+        if gradnorm < minnorm:
+            minnorm = gradnorm
+            Wnamemin = name
+        if gradnorm > maxnorm:
+            maxnorm = gradnorm
+            Wnamemax = name
+    logger.info('minnorm: %s %f\tmaxnorm: %s %f\tBN: %s %f' % (Wnamemin, minnorm, Wnamemax, maxnorm, BNnamemax, maxbnnorm))
+
 
 def train(num_epochs, lr):
 
     model = Net()
     optimizer = to.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.9))
-    dataholder = DataHolder("data_small_flat.npy", "data_aug_small_flat.npy")
+    # optimizer = to.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    dataholder = DataHolder("data_small_flat.npy", "data_aug_small_flat.npy", "data_pitch_small_flat.npy")
     dataloader = to.utils.data.DataLoader(
         dataholder, batch_size=BATCH_SIZE, shuffle=True, num_workers=2
     )
 
     num_iters_per_epoch = len(dataloader)
     model.to(DEVICE)
+    avg_loss = 0.
+    # model_params = model.named_parameters()
     for epoch in range(1, num_epochs + 1):
         model.train()
         for j, batch in enumerate(dataloader):
-            input_normal = batch[:, 0].to(DEVICE)
-            input_aug = batch[:, 1].to(DEVICE)
+            optimizer.zero_grad()
+            input_normal = batch[:, 0].repeat(2, 1, 1).to(DEVICE)
+            input_aug = batch[:, 1:].reshape(batch.size(0)*2, 3, 40).to(DEVICE)
+            logger.debug(input_normal.size())
+            logger.debug(input_aug.size())
             input_normal = input_normal.unsqueeze(1)
             input_aug = input_aug.unsqueeze(1)
 
@@ -141,16 +177,20 @@ def train(num_epochs, lr):
             loss += to.sum(to.stack([IID_loss(o, o_perturb) for o, o_perturb in zip(output_alt, output_aug_alt)]))
 
             loss.backward()
+            # report_gradnorms(model)
             optimizer.step()
 
+            loss = loss.item()
+            avg_loss = 0.8*avg_loss + 0.2*loss
             if j % (num_iters_per_epoch // 5) == 0:
                 logger.info(
                     "Train Epoch {} - LR {:.5f} -\tLoss: {:.6f}".format(
-                        epoch, lr, loss.item()
+                        epoch, lr, loss
                     )
                 )
 
     to.save(model.state_dict(), 'model.pt')
+    return loss
 
 
 def main(debug: ("Print debug messages", "flag", "d")):
@@ -179,6 +219,11 @@ def main(debug: ("Print debug messages", "flag", "d")):
     logger.info(f"Using device {DEVICE}")
 
     train(3, 0.005)
+    # best = fmin(fn=lambda x: train(3, x),
+    #             space=hp.uniform('x', 0.003, 0.01),
+    #             algo=tpe.suggest,
+    #             max_evals=5)
+    # print(best)
 
 
 if __name__ == '__main__':
