@@ -13,26 +13,29 @@ from loguru import logger
 
 BATCH_SIZE = 2048
 NUM_HEADS = 5
+INPUT_SIZE = 5
 DEVICE = ""
 
 
 class DataHolder(to.utils.data.Dataset):
-    def __init__(self, data_f, data_aug_f, data_pitch_f):
+    def __init__(self, data_f, data_aug_f, data_pitch_f, total_context=INPUT_SIZE):
         self.data = np.load(data_f)[:-1]
         self.data_aug = np.load(data_aug_f)[:-1]
         self.data_pitch = np.load(data_pitch_f)
         self.size = self.data.shape[0]
+        self.total_context = total_context
         assert self.size == self.data_aug.shape[0] == self.data_pitch.shape[0], '{} {} {}'.format(self.size, self.data_aug.shape[0], self.data_pitch.shape[0])
         logger.info(f"Num samples: {self.size}")
 
     def __len__(self):
-        return self.size - 2
+        return self.size - self.total_context
 
     def __getitem__(self, idx):
-        idx += 1
-        f = self.data[idx - 1: idx + 2]
-        f_aug = self.data_aug[idx - 1: idx + 2]
-        f_pitch = self.data_pitch[idx - 1: idx + 2]
+        lr_context = self.total_context // 2
+        idx += lr_context
+        f = self.data[idx - lr_context: idx + lr_context + 1]
+        f_aug = self.data_aug[idx - lr_context: idx + lr_context + 1]
+        f_pitch = self.data_pitch[idx - lr_context: idx + lr_context + 1]
         return np.asarray([f, f_aug, f_pitch])
 
 
@@ -81,14 +84,15 @@ class Net(nn.Module):
     def __init__(self, num_heads=NUM_HEADS, num_res_blocks=3):
         super(Net, self).__init__()
         self.bnin = nn.BatchNorm2d(1)
-        self.conv1 = nn.Conv2d(1, 256, (1, 40), 1, bias=False)
+        self.conv1 = nn.Conv2d(1, 256, (3, 40), 1, bias=False)
         self.bn1 = nn.BatchNorm2d(256)
 
-        self.fc_in = nn.Linear(3 * 40, 256, bias=False)
-        self.bn_fcin = nn.BatchNorm1d(256)
+        self.conv2 = nn.Conv2d(256, 256, (1, 1), 1, bias=False)
+        self.bn2 = nn.BatchNorm2d(256)
+        self.fc2 = nn.Linear(256 * 3, 256, bias=False)
 
-        self.fc_1 = nn.Linear(256 * 3, 256, bias=False)
-        self.bn_fc1 = nn.BatchNorm1d(256)
+        self.fc_bypass = nn.Linear(3 * 256, 256, bias=False)
+        self.bn_bypass = nn.BatchNorm1d(256)
 
         self.blocks = nn.ModuleList([ResBlock(256, 1024) for _ in range(num_res_blocks)])
         self.fc_prefinal = nn.Linear(256, 512, bias=False)
@@ -102,23 +106,24 @@ class Net(nn.Module):
         bs = xin.shape[0]
         xin = self.bnin(xin)
 
-        x = F.relu(self.bn1(self.conv1(xin)))
-        logger.debug(x.shape)
+        xin = F.relu(self.bn1(self.conv1(xin)))
+        logger.debug(xin.shape)
 
+        x = F.relu(self.bn2(self.conv2(xin)))
         x = x.view(bs, -1)
         xin = xin.view(bs, -1)
+        x_hidden = self.fc2(x) + self.bn_bypass(self.fc_bypass(xin))
 
-        x_prefinal = F.relu(self.bn_fc1(self.fc_1(x))) + F.relu(self.bn_fcin(self.fc_in(xin)))
-
-        logger.debug(x.shape)
+        logger.debug(x_hidden.shape)
         for block in self.blocks:
-            x_prefinal = block(x_prefinal)
-        x_prefinal = F.relu(self.bn_prefinal(self.fc_prefinal(x_prefinal)))
+            x_hidden = block(x_hidden)
+        x_hidden = F.relu(self.bn_prefinal(self.fc_prefinal(x_hidden)))
 
         logger.debug(x.shape)
-        x = [F.softmax(fc(x_prefinal), dim=1) for fc in self.fc_fin]
-        x_alt = [F.softmax(fc(x_prefinal), dim=1) for fc in self.fc_fin_alt]
+        x = [F.softmax(fc(x_hidden), dim=1) for fc in self.fc_fin]
+        x_alt = [F.softmax(fc(x_hidden), dim=1) for fc in self.fc_fin_alt if not isinstance(fc, list)]
         return x, x_alt
+
 
 def report_gradnorms(model):
     minnorm = 10
@@ -150,7 +155,7 @@ def train(num_epochs, lr):
     model = Net()
     optimizer = to.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.9))
     # optimizer = to.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
-    dataholder = DataHolder("data_small_flat.npy", "data_aug_small_flat.npy", "data_pitch_small_flat.npy")
+    dataholder = DataHolder("data/data_flat.npy", "data/data_aug_flat.npy", "data/data_pitch_flat.npy")
     dataloader = to.utils.data.DataLoader(
         dataholder, batch_size=BATCH_SIZE, shuffle=True, num_workers=2
     )
@@ -164,7 +169,7 @@ def train(num_epochs, lr):
         for j, batch in enumerate(dataloader):
             optimizer.zero_grad()
             input_normal = batch[:, 0].repeat(2, 1, 1).to(DEVICE)
-            input_aug = batch[:, 1:].reshape(batch.size(0)*2, 3, 40).to(DEVICE)
+            input_aug = batch[:, 1:].reshape(batch.size(0)*2, INPUT_SIZE, 40).to(DEVICE)
             logger.debug(input_normal.size())
             logger.debug(input_aug.size())
             input_normal = input_normal.unsqueeze(1)
@@ -185,7 +190,7 @@ def train(num_epochs, lr):
             if j % (num_iters_per_epoch // 5) == 0:
                 logger.info(
                     "Train Epoch {} - LR {:.5f} -\tLoss: {:.6f}".format(
-                        epoch, lr, loss
+                        epoch, lr, avg_loss
                     )
                 )
 

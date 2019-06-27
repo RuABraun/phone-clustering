@@ -29,6 +29,8 @@ def select_feats(arkf, phonealif, keys, outf):
     data = []
     feats_reader = python_rw.Pykread(arkf)
     cnt = 0
+    dct_key2indcs = {}
+    chunknum = 1
     with open(phonealif) as fh_ali:
         ismore = True
         while ismore:
@@ -48,7 +50,7 @@ def select_feats(arkf, phonealif, keys, outf):
             if (len(lineali) - mat.shape[0]) ** 2 > 1:
                 print('{} {}'.format(len(lineali), mat.shape[0]))
                 raise RuntimeError('Lengths do not match!')
-
+            starti = 0
             for i, t in enumerate(lineali):
                 if i >= num:
                     break
@@ -57,17 +59,30 @@ def select_feats(arkf, phonealif, keys, outf):
                 else:
                     if len(data_arr) > 4:
                         data.append(np.array(data_arr))
+                        dct_key2indcs[key + f' {chunknum}'] = (starti, i-1)
+                        chunknum += 1
                     data_arr = []
+                    starti = i + 1
 
             if len(data_arr) > 4:
                 data.append(np.array(data_arr))
+                dct_key2indcs[key + f' {chunknum}'] = (starti, i - 1,)
+                chunknum += 1
             ismore = feats_reader.next()
     print(f'Found {cnt}')
     feats_reader.close()
     dataf = outf + '.npy'
     np.save(dataf, data)
     num_chunks = len(data)
+    np.save(outf + '_small.npy', data[:10000])
+    np.save(outf + '_small_flat.npy', np.vstack(data[:10000]))
+    np.save(outf + '_flat.npy', np.vstack(data))
     print(f'Saved {dataf}, found {num_chunks}')
+
+    with open('utt2indcs', 'w') as fh:
+        for k, v in dct_key2indcs.items():
+            v = ' '.join(str(e) for e in v)
+            fh.write(f'{k} {v}\n')
 
 
 def main(datadir, alif, workdir, outf_base):

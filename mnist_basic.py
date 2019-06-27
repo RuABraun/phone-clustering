@@ -1,3 +1,4 @@
+""" ! IMPORTANT NOTICE: You will want to adjust the device setting in main() """
 from __future__ import print_function
 
 import argparse
@@ -15,10 +16,8 @@ import torchvision as tv
 import torchvision.transforms.functional as TF
 from loguru import logger
 from torchvision import datasets, transforms
-from hyperopt import fmin, tpe, hp
 import random
 
-from ekfac import EKFAC
 
 plt.style.use('ggplot')
 
@@ -75,9 +74,9 @@ def IID_loss(x_out, x_tf_out, EPS=sys.float_info.epsilon):
     return loss
 
 
-class NetX(nn.Module):
+class Net(nn.Module):
     def __init__(self, num_heads=5):
-        super(NetX, self).__init__()
+        super(Net, self).__init__()
         self.conv1 = nn.Conv2d(1, 128, 5, 2, bias=False)
         self.bn1 = nn.BatchNorm2d(128)
         self.conv2 = nn.Conv2d(128, 128, 5, 1, bias=False)
@@ -88,14 +87,9 @@ class NetX(nn.Module):
         self.bn4 = nn.BatchNorm2d(256)
         self.fc1 = nn.Linear(256, 512, bias=False)
         self.bn_fc = nn.BatchNorm1d(512)
-        # self.fc_xent = nn.Linear(512, 512)
-        # self.fc_iic = nn.Linear(512, 512)
 
-        # self.fc2 = nn.ModuleList([nn.Linear(512, 10) for _ in range(5)])
-        self.fc_xent2 = nn.Linear(512, 10)
-        # self.fc2_alt = nn.ModuleList([nn.Linear(512, 20) for _ in range(5)])
-        self.fc2 = nn.Linear(512, 10)
-        # self.fc2_alt = nn.Linear(512, 20)
+        self.fc2 = nn.ModuleList([nn.Linear(512, 10) for _ in range(5)])
+        self.fc2_alt = nn.ModuleList([nn.Linear(512, 20) for _ in range(5)])
 
     def forward(self, x):
         logger.debug(x.shape)
@@ -108,16 +102,10 @@ class NetX(nn.Module):
         x = F.relu(self.bn4(self.conv4(x)))
         logger.debug(x.shape)
         x = x.view(x.size(0), -1)
-        x = F.relu(self.bn_fc(self.fc1(x)))
+        x_prefinal = F.relu(self.bn_fc(self.fc1(x)))
 
-        # x_prefinal = F.relu(self.fc_iic(x))
-        # x_xent = F.relu(self.fc_xent(x))
-        # logger.debug(x_prefinal.shape)
-        # x = [F.softmax(fc(x_prefinal), dim=1) for fc in self.fc2]
-        x_alt = F.log_softmax(self.fc_xent2(x), dim=1)
-        # x_alt = [F.softmax(fc(x_prefinal), dim=1) for fc in self.fc2_alt]
-        x = F.softmax(self.fc2(x), dim=1)
-        # x_alt = F.softmax(self.fc2_alt(x_prefinal), dim=1)
+        x = [F.softmax(fc(x_prefinal), dim=1) for fc in self.fc2]
+        x_alt = [F.softmax(fc(x_prefinal), dim=1) for fc in self.fc2_alt]
         return x, x_alt
 
 
@@ -149,7 +137,7 @@ def report_gradnorms(model):
     logger.info('minnorm: %s %f\tmaxnorm: %s %f\tBN: %s %f' % (Wnamemin, minnorm, Wnamemax, maxnorm, BNnamemax, maxbnnorm))
 
 
-def train_epoch(args, model, device, train_loader, optimizer, preconditioner, epoch, num_epochs):
+def train_epoch(args, model, device, train_loader, optimizer, epoch, num_epochs):
     model.train()
     num_iters_per_epoch = len(train_loader)
     total_num_iters = num_iters_per_epoch * num_epochs
@@ -185,28 +173,20 @@ def train_epoch(args, model, device, train_loader, optimizer, preconditioner, ep
         output, output_alt = model(data)
         output_perturb, output_perturb_alt = model(data_perturb)
 
-        # loss = torch.sum(torch.stack([IID_loss(o, o_perturb) for o, o_perturb in zip(output, output_perturb)]))
-        loss = IID_loss(output, output_perturb)
-        target = target.repeat(2).to(device)
-        if epoch < 8:
-            loss += xent_loss(output_alt, target)
-            loss += xent_loss(output_perturb_alt, target)
-        # loss += torch.sum(torch.stack([IID_loss(o, o_perturb) for o, o_perturb in zip(output_alt, output_perturb_alt)]))
-        # loss = IID_loss(output, output_perturb)
-        # loss += IID_loss(output_alt, output_perturb_alt)
-        # logger.info('Loss %f' % loss.item())
+        loss = torch.sum(torch.stack([IID_loss(o, o_perturb) for o, o_perturb in zip(output, output_perturb)]))
+        loss += torch.sum(torch.stack([IID_loss(o, o_perturb) for o, o_perturb in zip(output_alt, output_perturb_alt)]))
+
         loss.backward()
-        # preconditioner.step()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
             logger.info('Train Epoch {} - LR {:.5f} -\tLoss: {:.6f}'.format(
                 epoch, new_lr, loss.item()))
             # report_gradnorms(model)
-        # if batch_idx == len(train_loader) - 1:
-        #     losses = [0 for _ in range(5)]
-        #     for i in range(5):
-        #         losses[i] = IID_loss(output[i], output_perturb[i])
-        #     logger.info('Losses: %s' % ' '.join([str(l.item()) for l in losses]))
+        if batch_idx == len(train_loader) - 1:
+            losses = [0 for _ in range(5)]
+            for i in range(5):
+                losses[i] = IID_loss(output[i], output_perturb[i])
+            logger.info('Losses: %s' % ' '.join([str(l.item()) for l in losses]))
 
 
 def test(model, device, test_loader):
@@ -214,7 +194,6 @@ def test(model, device, test_loader):
     out_targs = [[] for _ in range(1)]
     ref_targs = []
     cnt = 0
-    xent_accuracy = 0.
     num_heads = -1
     with torch.no_grad():
         for data, target in test_loader:
@@ -222,14 +201,11 @@ def test(model, device, test_loader):
             data = data.to(device)
             target = target.to(device)
             outputs, outputs_alt = model(data)
-            xent_accuracy += (outputs_alt.argmax(-1) == target).sum().item() / target.size(0)
             num_heads = len(out_targs)
-            # for i in range(num_heads):
-            #     out_targs[i].append(outputs[i].argmax(dim=1).cpu())
-            out_targs[0].append(outputs.argmax(dim=1).cpu())
+            for i in range(num_heads):
+                out_targs[i].append(outputs[i].argmax(dim=1).cpu())
             ref_targs.append(target.cpu())
-    xent_accuracy /= cnt
-    logger.info('Xent accuracy: %s' % str(xent_accuracy))
+
     out_targs = [torch.cat(out_targs[i]).cpu() for i in range(num_heads)]
     ref_targs = torch.cat(ref_targs)
 
@@ -279,18 +255,16 @@ def train(args, device, lr):
         ])),
         batch_size=4096, shuffle=True, **kwargs)
 
-    model = NetX()
-    # model.fc2.weights = torch.ones(model.fc2.in_features, model.fc2.out_features) * 0.01
+    model = Net()
     model.to(device)
-    # preconditioner = EKFAC(model, 0.1, ra=True, update_freq=5)
-    preconditioner = None
+
     optimizer = optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.9,), weight_decay=0.0)
     acc = None
     for epoch in range(1, args.epochs + 1):
-        train_epoch(args, model, device, train_loader, optimizer, preconditioner, epoch, args.epochs)
+        train_epoch(args, model, device, train_loader, optimizer, epoch, args.epochs)
         acc = test(model, device, test_loader)
 
-    if (args.save_model):
+    if args.save_model:
         torch.save(model.state_dict(), "mnist_cnn.pt")
     return acc
 
@@ -338,11 +312,7 @@ def main():
     logger.info(f'Using device {device}')
 
     train(args, device, args.lr)
-    # best = fmin(fn=lambda x: train(args, device, x),
-    #             space=hp.uniform('x', 0.01, 0.002),
-    #             algo=tpe.suggest,
-    #             max_evals=10)
-    # print(best)
+
 
 if __name__ == '__main__':
     main()
