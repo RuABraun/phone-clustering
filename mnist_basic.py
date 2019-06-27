@@ -4,7 +4,6 @@ from __future__ import print_function
 import argparse
 import subprocess as sp
 import sys
-import os
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,8 +15,6 @@ import torchvision as tv
 import torchvision.transforms.functional as TF
 from loguru import logger
 from torchvision import datasets, transforms
-import random
-
 
 plt.style.use('ggplot')
 
