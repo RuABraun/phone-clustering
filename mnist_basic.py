@@ -188,7 +188,7 @@ def train_epoch(args, model, device, train_loader, optimizer, epoch, num_epochs)
 
 def test(model, device, test_loader):
     model.eval()
-    out_targs = [[] for _ in range(1)]
+    out_targs = [[] for _ in range(5)]
     ref_targs = []
     cnt = 0
     num_heads = -1
