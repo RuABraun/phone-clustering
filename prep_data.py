@@ -2,7 +2,8 @@ import plac
 import numpy as np
 import subprocess as sp
 import os
-import python_rw
+
+MINLEN = 4
 
 
 def calc_feats(datadir, aug_datadir, pitch_datadir):
@@ -31,6 +32,7 @@ def select_feats(arkf, phonealif, keys, outf):
     cnt = 0
     dct_key2indcs = {}
     chunknum = 1
+    alidata = []
     with open(phonealif) as fh_ali:
         ismore = True
         while ismore:
@@ -51,20 +53,25 @@ def select_feats(arkf, phonealif, keys, outf):
                 print('{} {}'.format(len(lineali), mat.shape[0]))
                 raise RuntimeError('Lengths do not match!')
             starti = 0
+            lst = []
             for i, t in enumerate(lineali):
                 if i >= num:
                     break
                 if t > 10:  # not silence or jnk
+                    lst.append(t)
                     data_arr.append(mat[i])
                 else:
-                    if len(data_arr) > 4:
+                    if len(data_arr) > MINLEN:
+                        alidata.extend(lst)
                         data.append(np.array(data_arr))
                         dct_key2indcs[key + f' {chunknum}'] = (starti, i-1)
                         chunknum += 1
+                    lst = []
                     data_arr = []
                     starti = i + 1
 
-            if len(data_arr) > 4:
+            if len(data_arr) > MINLEN:
+                alidata.extend(lst)
                 data.append(np.array(data_arr))
                 dct_key2indcs[key + f' {chunknum}'] = (starti, i - 1,)
                 chunknum += 1
@@ -79,6 +86,10 @@ def select_feats(arkf, phonealif, keys, outf):
     np.save(outf + '_flat.npy', np.vstack(data))
     print(f'Saved {dataf}, found {num_chunks}')
 
+    if not os.path.exists('data/ali.npy'):
+        np.save('data/ali.npy', alidata)
+        np.save('data/ali_small.npy', alidata[:10000])
+
     with open('utt2indcs', 'w') as fh:
         for k, v in dct_key2indcs.items():
             v = ' '.join(str(e) for e in v)
@@ -86,19 +97,21 @@ def select_feats(arkf, phonealif, keys, outf):
 
 
 def main(datadir, alif, workdir, outf_base):
-    """ Extracts contiguous non silence features . """
+    """ Extracts contiguous non silence features.
+        Call like:
+            py3 prep_data.py /work/data-50h/train_cleaned_fbank '/work/exp-50h/tri3_ali_cleaned/ali.*.gz' tmpwork/ data/data"""
     model = os.path.dirname(alif) + '/final.mdl'
 
     aug_datadir = '{}_augmented'.format(datadir.rstrip('/'))
     pitch_datadir = '{}_pitched'.format(datadir.rstrip('/'))
-    calc_feats(datadir, aug_datadir, pitch_datadir)
-
-    # convert ali to phones
-    cmd = f'ali-to-phones --per-frame=true {model} "ark:gunzip -c {alif}|" ark,scp:{workdir}/phoneali,{workdir}/phoneali.scp'
-    sp.check_output(cmd, shell=True)
-    sp.check_output(f"sort -u {workdir}/phoneali.scp -o {workdir}/phoneali.scp", shell=True)
-    cmd = f'copy-int-vector scp:{workdir}/phoneali.scp ark,t:{workdir}/phoneali_sorted.txt'
-    sp.check_output(cmd, shell=True)
+    # calc_feats(datadir, aug_datadir, pitch_datadir)
+    #
+    # # convert ali to phones
+    # cmd = f'ali-to-phones --per-frame=true {model} "ark:gunzip -c {alif}|" ark,scp:{workdir}/phoneali,{workdir}/phoneali.scp'
+    # sp.check_output(cmd, shell=True)
+    # sp.check_output(f"sort -u {workdir}/phoneali.scp -o {workdir}/phoneali.scp", shell=True)
+    # cmd = f'copy-int-vector scp:{workdir}/phoneali.scp ark,t:{workdir}/phoneali_sorted.txt'
+    # sp.check_output(cmd, shell=True)
 
     keys = set()
     with open(f'{workdir}/phoneali.scp') as fh:
@@ -128,4 +141,6 @@ def main(datadir, alif, workdir, outf_base):
                  outf_base + '_pitch')
 
 
-plac.call(main)
+if __name__ == '__main__':
+    import python_rw
+    plac.call(main)

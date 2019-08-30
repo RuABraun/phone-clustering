@@ -50,7 +50,7 @@ def compute_joint(x_out, x_tf_out):
     return p_i_j
 
 
-def IID_loss(x_out, x_tf_out, EPS=sys.float_info.epsilon):
+def IID_loss(x_out, x_tf_out, l=1.25, EPS=sys.float_info.epsilon):
     # has had softmax applied
     bs, k = x_out.size()
     p_i_j = compute_joint(x_out, x_tf_out)
@@ -64,7 +64,7 @@ def IID_loss(x_out, x_tf_out, EPS=sys.float_info.epsilon):
     p_j[(p_j < EPS).data] = EPS
     p_i[(p_i < EPS).data] = EPS
     # print(p_i_j)
-    loss = (-p_i_j * (to.log(p_i_j) - to.log(p_j) - to.log(p_i))).sum()
+    loss = (-p_i_j * (to.log(p_i_j) - l * to.log(p_j) - l * to.log(p_i))).sum()
     return loss
 
 
@@ -98,8 +98,12 @@ class Net(nn.Module):
         self.fc_prefinal = nn.Linear(256, 512, bias=False)
         self.bn_prefinal = nn.BatchNorm1d(512)
 
-        self.fc_fin = nn.ModuleList([nn.Linear(512, 192) for _ in range(num_heads)])
-        self.fc_fin_alt = nn.ModuleList([nn.Linear(512, 400) for _ in range(num_heads)])
+        self.fc_fin = nn.Linear(512, 192)
+        self.fc_fin_alt = nn.Linear(512, 400)
+        nn.init.orthogonal_(self.fc_fin.weight.data)
+        nn.init.orthogonal_(self.fc_fin_alt.weight.data)
+        self.fc_fin.bias.fill_(0)
+        self.fc_fin_alt.bias.fill_(0)
 
     def forward(self, xin):
         logger.debug(xin.shape)
@@ -120,8 +124,8 @@ class Net(nn.Module):
         x_hidden = F.relu(self.bn_prefinal(self.fc_prefinal(x_hidden)))
 
         logger.debug(x.shape)
-        x = [F.softmax(fc(x_hidden), dim=1) for fc in self.fc_fin]
-        x_alt = [F.softmax(fc(x_hidden), dim=1) for fc in self.fc_fin_alt if not isinstance(fc, list)]
+        x = F.softmax(self.fc_fin(x_hidden), dim=1)
+        x_alt = F.softmax(self.fc_fin_alt(x_hidden), dim=1)
         return x, x_alt
 
 
@@ -223,7 +227,7 @@ def main(debug: ("Print debug messages", "flag", "d")):
         DEVICE = "cuda:1"
     logger.info(f"Using device {DEVICE}")
 
-    train(3, 0.005)
+    train(10, 0.005)
     # best = fmin(fn=lambda x: train(3, x),
     #             space=hp.uniform('x', 0.003, 0.01),
     #             algo=tpe.suggest,
